@@ -1,0 +1,36 @@
+# Reviewed changes, staging evaluation and release approval.
+name: HR application delivery and evaluation
+on:
+  pull_request:
+  push:
+    branches: [main, 'feature/**', 'fix/**', 'test/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: hr-staging
+  cancel-in-progress: false
+jobs:
+  # Validate proposed changes before giving code deployment credentials.
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install delivery helper dependencies
+        run: python -m pip install -r ci/requirements.txt
+      - name: Prompt structure and release contract tests
+        run: python -m unittest discover -s ci/tests -v
+      - name: Build backend candidate with release identity
+        run: python ci/release.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm --prefix frontend ci
+      - run: npm --prefix frontend run build
