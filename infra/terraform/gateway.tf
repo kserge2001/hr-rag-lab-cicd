@@ -92,14 +92,18 @@ resource "aws_iam_role_policy" "gateway" {
   policy = jsonencode({ Version = "2012-10-17", Statement = [
     { Effect = "Allow", Action = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"], Resource = local.chat_model_arns },
     { Effect = "Allow", Action = ["secretsmanager:GetSecretValue"], Resource = aws_secretsmanager_secret.gateway_settings.arn },
-    { Effect = "Allow", Action = ["secretsmanager:PutSecretValue"], Resource = aws_secretsmanager_secret.gateway_app_key.arn }
+    # Read as well as write: a rebuilt gateway updates the key an earlier instance saved.
+    { Effect = "Allow", Action = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"], Resource = aws_secretsmanager_secret.gateway_app_key.arn }
   ] })
 }
 resource "aws_iam_instance_profile" "gateway" { role = aws_iam_role.gateway.name }
 resource "aws_instance" "llm_gateway" {
-  ami                         = data.aws_ssm_parameter.gateway_ami.value
-  instance_type               = "t3.medium"
-  subnet_id                   = aws_subnet.gateway.id
+  ami           = data.aws_ssm_parameter.gateway_ami.value
+  instance_type = "t3.medium"
+  subnet_id     = aws_subnet.gateway.id
+  # A fixed address. The API calls a published Lambda version, and each version keeps
+  # the gateway address it was published with, so the address must survive replacement.
+  private_ip                  = cidrhost(aws_subnet.gateway.cidr_block, 10)
   vpc_security_group_ids      = [aws_security_group.gateway.id]
   iam_instance_profile        = aws_iam_instance_profile.gateway.name
   user_data_replace_on_change = true
@@ -113,11 +117,12 @@ resource "aws_instance" "llm_gateway" {
     delete_on_termination = true
   }
   user_data = templatefile("${path.module}/gateway-bootstrap.sh.tftpl", {
-    region          = var.aws_region, host = aws_rds_cluster.aurora.endpoint,
-    settings_secret = aws_secretsmanager_secret.gateway_settings.arn,
-    key_secret      = aws_secretsmanager_secret.gateway_app_key.arn,
-    chat_model      = var.chat_model_id,
-    fallback_model  = var.fallback_chat_model_id != "" ? var.fallback_chat_model_id : var.chat_model_id
+    region           = var.aws_region, host = aws_rds_cluster.aurora.endpoint,
+    settings_secret  = aws_secretsmanager_secret.gateway_settings.arn,
+    key_secret       = aws_secretsmanager_secret.gateway_app_key.arn,
+    chat_model       = var.chat_model_id,
+    fallback_model   = var.fallback_chat_model_id != "" ? var.fallback_chat_model_id : var.chat_model_id
+    secondary_region = var.gateway_secondary_region
   })
   depends_on = [aws_secretsmanager_secret_version.gateway_settings, aws_iam_role_policy.gateway, aws_route_table_association.gateway]
   tags       = { Name = "${local.name}-llm-gateway" }
@@ -128,9 +133,9 @@ output "gateway_app_key_secret_arn" { value = aws_secretsmanager_secret.gateway_
 output "evaluation_function" { value = aws_lambda_function.app["evaluate"].function_name }
 
 resource "aws_vpc_security_group_ingress_rule" "endpoints_from_gateway" {
-  security_group_id = aws_security_group.endpoints.id
-  ip_protocol = "tcp"
-  from_port = 443
-  to_port = 443
+  security_group_id            = aws_security_group.endpoints.id
+  ip_protocol                  = "tcp"
+  from_port                    = 443
+  to_port                      = 443
   referenced_security_group_id = aws_security_group.gateway.id
 }

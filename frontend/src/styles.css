@@ -337,3 +337,12 @@ button:disabled { cursor: default; }
   .ask-wrap { padding: 12px 14px 16px; }
   .topbar { padding: 12px 14px; }
 }
+
+/* Thumbs up or down under an answer */
+.feedback { display: flex; align-items: center; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.feedback > button { background: none; border: 1px solid transparent; border-radius: 6px; cursor: pointer; font-size: 15px; padding: 2px 6px; opacity: 0.6; }
+.feedback > button:hover, .feedback > button.chosen { opacity: 1; border-color: currentColor; }
+.feedback-comment { display: flex; gap: 6px; flex: 1 1 220px; }
+.feedback-comment input { flex: 1; min-width: 0; padding: 4px 8px; border-radius: 6px; border: 1px solid #c8ccd2; font: inherit; }
+.feedback-comment button { padding: 4px 10px; border-radius: 6px; border: none; cursor: pointer; }
+.feedback-thanks { margin: 8px 0 0; font-size: 13px; opacity: 0.7; }

@@ -36,7 +36,9 @@ locals {
     "GET /api/me"                          = true
     "GET /api/conversations"               = true
     "GET /api/conversations/{id}/messages" = true
+    "DELETE /api/conversations/{id}"       = true
     "POST /api/chat"                       = true
+    "POST /api/feedback"                   = true
   }
 }
 

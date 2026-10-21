@@ -6,18 +6,14 @@ The Lambda reads its scoped gateway key from Secrets Manager using its AWS role.
 Policy retrieval and employee-record permissions remain enforced by the backend.
 """
 
-from app.model_gateway import GatewayUnavailable
-
 import json
 import re
 import time
 from functools import cache
 
-from botocore.exceptions import BotoCoreError, ClientError
-
 from app import config, database, employees, guardrails, retrieval
 from app.inline_judge import validate_answer
-from app.telemetry import observed
+from app.telemetry import observed, span, update_current_span
 
 # Nova narrates its reasoning inside the answer text. Worth seeing once, and not
 # something a person asking about holiday should ever read.
@@ -66,7 +62,8 @@ TEMPERATURE = 0.0
 @cache
 def client():
     from app.model_gateway import GatewayClient
-    return GatewayClient(timeout=20)
+    # LiteLLM feature 8, tags: chat answers are tagged hr-chat in the gateway.
+    return GatewayClient(timeout=20, purpose="hr-chat")
 
 
 # The tools, described so the model knows what each one does and what input it
@@ -146,13 +143,29 @@ def run_tool(name, tool_input, employee, sources, old_version=False):
         if old_version and any(r.get("status") == "superseded" for r in results):
             extracts.insert(0, "The person is asking about an older version. Answer from "
                                "the SUPERSEDED passages only. Include current rules only if the person requests a comparison.")
-        return "\n\n".join(extracts) or "No matching policy text."
+        result = "\n\n".join(extracts) or "No matching policy text."
+        _record_tool(name, tool_input, old_version, result, {"passages_returned": len(results)})
+        return result
 
     if name != "get_employee_records":
         raise ValueError("Unknown tool")
 
     # get_employee_records: the database only returns rows this employee may see
-    return json.dumps(employees.visible_records(employee), default=str)
+    rows = employees.visible_records(employee)
+    result = json.dumps(rows, default=str)
+    _record_tool(name, tool_input, old_version, result, {"records_returned": len(rows)})
+    return result
+
+
+def _record_tool(name, tool_input, old_version, result, counts):
+    """Tracing: the tool's arguments as the model wrote them, and the text sent back to it."""
+    metadata = {"tool": name, "result_characters": len(result), "old_version": old_version}
+    metadata.update(counts)
+    update_current_span(
+        input={"tool": name, "arguments": tool_input},
+        output={"result": result},
+        metadata=metadata,
+    )
 
 
 def _text_of(message):
@@ -200,25 +213,67 @@ def _strip_empty_sources(text, sources):
 
 
 @observed("Bedrock model call", "generation")
-def _call_model(model, request, usage):
-    """Call the model. If it will not answer, try the fallback model instead.
+def _call_model(model, request, usage, round_number=None):
+    """Call the model through the gateway. Returns (response, model_used).
 
-    Returns (response, model_used). Once we have moved to the fallback we stay
-    there for the rest of this question, so the caller keeps the model back.
+    The gateway owns fallback: when the chat model will not answer, it retries the
+    same request on the fallback model and reports which model answered. Once the
+    fallback has answered we stay there for the rest of this question, so the
+    caller keeps the model back.
     """
-    try:
-        return client().converse(modelId=model, **request), model
-    except (BotoCoreError, ClientError, GatewayUnavailable) as error:
-        # A model can be throttled, still warming up, withdrawn, or simply not
-        # enabled in this account. None of that is the user's problem, and every
-        # model here speaks the same Converse shape, so the same conversation
-        # can carry on with a different one.
-        fallback = config.FALLBACK_CHAT_MODEL
-        if not fallback or model == fallback:
-            raise
-        print(f"{model} unavailable ({error}), falling back to {fallback}")
+    response = client().converse(modelId=model, **request)
+    gateway = response.get("gateway", {})
+    _record_model_call(model, request, response, round_number)
+    # LiteLLM feature 3, fallback: LiteLLM already switched models if it had to.
+    # Here the application only records that it happened.
+    if gateway.get("fallback"):
+        print(f"{model} unavailable, the gateway answered with {gateway.get('model')}")
         usage["tools_used"].append("model_fallback")
-        return client().converse(modelId=fallback, **request), fallback
+    return response, gateway.get("model") or model
+
+
+def _record_model_call(model, request, response, round_number):
+    """Tracing: the full request and reply of one model call, with its settings, tokens and cost."""
+    gateway = response.get("gateway", {})
+    message = response["output"]["message"]
+    tokens = response.get("usage", {})
+
+    offered = []
+    for tool in request["toolConfig"]["tools"]:
+        offered.append(tool["toolSpec"]["name"])
+    requested = []
+    for block in message.get("content", []):
+        if "toolUse" in block:
+            requested.append(block["toolUse"]["name"])
+
+    if gateway.get("fallback"):
+        level = "WARNING"
+        status_message = f"{model} did not answer; the gateway used {gateway.get('model')}"
+    else:
+        level = None
+        status_message = None
+
+    update_current_span(
+        input={"system": request["system"], "messages": request["messages"]},
+        output={"content": message.get("content", [])},
+        model=gateway.get("model") or model,
+        model_parameters=request["inferenceConfig"],
+        usage={"input": tokens.get("inputTokens", 0), "output": tokens.get("outputTokens", 0)},
+        cost_usd=gateway.get("cost_usd"),
+        metadata={
+            "round": round_number,
+            "model_requested": model,
+            "tools_offered": offered,
+            "tool_choice": request["toolConfig"].get("toolChoice", "auto"),
+            "stop_reason": response.get("stopReason"),
+            "tools_requested": requested,
+            "gateway_deployment": gateway.get("deployment", ""),
+            "fallback_used": bool(gateway.get("fallback")),
+            "messages_sent": len(request["messages"]),
+        },
+        level=level,
+        status_message=status_message,
+    )
 
 
 def _run_requested_tools(message, employee, sources, usage, old_version=False, policy_context=None):
@@ -267,18 +322,33 @@ def policy_question_context(question, history):
     return context
 
 
+def answer(question, history, employee, question_checked=False, question_guardrail=None):
+    """Answer a question. Returns (answer_text, sources).
+
+    1. Guardrail on the question. This runs before the traced part below, so a
+    blocked or masked value never reaches Langfuse, the request log or the model.
+    The chat handler checks the question itself, before storing it, and passes
+    question_checked=True so it is not checked twice.
+    """
+    if not question_checked:
+        status, safe_question = guardrails.check(question, "INPUT")
+        if status == "blocked":
+            usage = {"input_tokens": 0, "output_tokens": 0, "tools_used": ["guardrail_blocked_input"]}
+            log_request(employee, guardrails.REMOVED, usage, time.time())
+            return safe_question, []
+        # "allowed" keeps the question as it was; "masked" replaces parts such as a phone number.
+        question = safe_question
+        question_guardrail = {"decision": status, "findings": guardrails.LAST_FINDINGS}
+    return _answer(question, history, employee, question_guardrail)
+
+
 @observed("HR answer", "agent")
-def answer(question, history, employee):
-    """Answer a question. Returns (answer_text, sources)."""
+def _answer(question, history, employee, question_guardrail=None):
+    """Answer a question the guardrail has already checked. Returns (answer_text, sources)."""
     started = time.time()
     usage = {"input_tokens": 0, "output_tokens": 0, "tools_used": []}
-
-    # 1. Guardrail on the question
-    blocked, guarded_text = guardrails.check(question, "INPUT")
-    if blocked:
-        usage["tools_used"].append("guardrail_blocked_input")
-        log_request(employee, question, usage, started)
-        return guarded_text, []
+    trace = {"question": question, "history_turns": len(history), "role": employee.get("role"),
+             "question_guardrail": question_guardrail or "not checked", "rounds": 0}
 
     # Greetings and thanks get a fixed reply: no model call, and nothing for the
     # ungrounded-answer check below to mistake for an invented answer.
@@ -286,6 +356,7 @@ def answer(question, history, employee):
     if social:
         usage["tools_used"].append("small_talk")
         log_request(employee, question, usage, started)
+        _record_answer(trace, social, [], usage, "small talk: fixed reply, no model call")
         return social, []
 
     # The model remembers nothing, so the whole conversation goes every time.
@@ -305,73 +376,129 @@ def answer(question, history, employee):
     old_version = not wants_current and any(
         retrieval.asks_for_old_version(text) for text in recent_questions + [question]
     )
+    trace["old_version"] = old_version
+    trace["follow_up_context_used"] = policy_context is not None
 
-    # Start on the model we want. If it will not answer, the loop below moves to
-    # the fallback and stays there for the rest of this question.
+    # Start on the model we want. If the gateway answers with the fallback, the
+    # loop below stays on the fallback for the rest of this question.
     model = config.CHAT_MODEL
 
     # 2-3. Ask, run the tools it wants, repeat
+    finished = None    # set to (answer, sources, answer_guardrail) when a round produces the answer
     for round_number in range(MAX_TOOL_ROUNDS):
-        tool_config = {"tools": TOOLS}
-        if round_number == 0:
-            # The first step of every question must be a tool call. Asked politely in
-            # the prompt, the model still answered follow-ups from memory, and invented
-            # the figures (15 days of PTO, 60 carried over). "any" makes the lookup a
-            # rule of the code, not a request to the model.
-            # Policy figures must come from policy documents, not inferred salaries.
-            policy_question = re.search(
-                r"\b(policy|policies|carryover|carry over|salary band|pay band|entitlement|tuition|degrees?|pto|time off)\b",
-                contextual_question, re.I,
-            )
-            if policy_question:
-                tool_config["tools"] = [TOOLS[0]]
-            tool_config["toolChoice"] = {"any": {}}
+        trace["rounds"] = round_number + 1
+        # Each round is one step in the trace: a model call, then the tools it asked for.
+        with span(f"Agent round {round_number + 1}", "chain"):
+            tool_config = {"tools": TOOLS}
+            if round_number == 0:
+                # The first step of every question must be a tool call. Asked politely in
+                # the prompt, the model still answered follow-ups from memory, and invented
+                # the figures (15 days of PTO, 60 carried over). "any" makes the lookup a
+                # rule of the code, not a request to the model.
+                # Policy figures must come from policy documents, not inferred salaries.
+                policy_question = re.search(
+                    r"\b(policy|policies|carryover|carry over|salary band|pay band|entitlement|tuition|degrees?|pto|time off)\b",
+                    contextual_question, re.I,
+                )
+                if policy_question:
+                    tool_config["tools"] = [TOOLS[0]]
+                tool_config["toolChoice"] = {"any": {}}
 
-        request = {
-            "messages": messages,
-            "system": [{"text": SYSTEM_PROMPT.format(**employee)}],
-            "inferenceConfig": {"maxTokens": MAX_ANSWER_TOKENS, "temperature": TEMPERATURE},
-            "toolConfig": tool_config,
-        }
-        response, model = _call_model(model, request, usage)
+            request = {
+                "messages": messages,
+                "system": [{"text": SYSTEM_PROMPT.format(**employee)}],
+                "inferenceConfig": {"maxTokens": MAX_ANSWER_TOKENS, "temperature": TEMPERATURE},
+                "toolConfig": tool_config,
+            }
+            response, model = _call_model(model, request, usage, round_number + 1)
 
-        tokens = response.get("usage", {})
-        usage["input_tokens"] += tokens.get("inputTokens", 0)
-        usage["output_tokens"] += tokens.get("outputTokens", 0)
-        message = response["output"]["message"]
+            tokens = response.get("usage", {})
+            usage["input_tokens"] += tokens.get("inputTokens", 0)
+            usage["output_tokens"] += tokens.get("outputTokens", 0)
+            message = response["output"]["message"]
 
-        if response.get("stopReason") != "tool_use":
-            text = _strip_empty_sources(_text_of(message), sources)
-            sources = _cited(text, sources)
+            if response.get("stopReason") != "tool_use":
+                text = _strip_empty_sources(_text_of(message), sources)
+                sources = _cited(text, sources)
 
-            # An answer with nothing behind it: no policy cited, no employee record
-            # read, and not a question back to the person. Asked for "SRE" or
-            # "devops", the model said the policies did not cover it and then
-            # explained it from general knowledge anyway. The prompt forbids that;
-            # this is the half that does not depend on the model obeying.
-            if not sources and "get_employee_records" not in usage["tools_used"] and "?" not in text:
-                usage["tools_used"].append("ungrounded_answer_replaced")
-                text = NOT_COVERED
+                # An answer with nothing behind it: no policy cited, no employee record
+                # read, and not a question back to the person. Asked for "SRE" or
+                # "devops", the model said the policies did not cover it and then
+                # explained it from general knowledge anyway. The prompt forbids that;
+                # this is the half that does not depend on the model obeying.
+                if not sources and "get_employee_records" not in usage["tools_used"] and "?" not in text:
+                    usage["tools_used"].append("ungrounded_answer_replaced")
+                    text = NOT_COVERED
 
-            # Hold the draft for a bounded judge/revision; no additional tool access.
-            text = validate_answer(contextual_question, text, messages, employee, judge_client(), remaining_seconds=max(0, 25-(time.time()-started)))
-            sources = _cited(text, sources)
+                # Hold the draft for a bounded judge/revision; no additional tool access.
+                text = validate_answer(contextual_question, text, messages, employee, judge_client(), remaining_seconds=max(0, 25-(time.time()-started)))
+                sources = _cited(text, sources)
 
-            # 4. Guardrail on the answer
-            changed, text = guardrails.check(text, "OUTPUT")
-            if changed:
-                usage["tools_used"].append("guardrail_changed_output")
+                # 4. Guardrail on the answer
+                # "masked" replaces parts such as an email address; "blocked" replaces the whole answer.
+                status, text = guardrails.check(text, "OUTPUT")
+                if status != "allowed":
+                    usage["tools_used"].append("guardrail_changed_output")
 
-            log_request(employee, question, usage, started)
-            return text, sources
+                log_request(employee, question, usage, started)
+                update_current_span(metadata={"round": round_number + 1, "ended_with": "the answer"})
+                finished = (text, sources, status)
+                break   # leaves this round's span, so the summary below lands on the top span
 
-        # Send the model's own turn back verbatim, then the tool results.
-        messages.append(message)
-        results = _run_requested_tools(message, employee, sources, usage, old_version, policy_context)
-        messages.append({"role": "user", "content": results})
+            # Send the model's own turn back verbatim, then the tool results.
+            messages.append(message)
+            results = _run_requested_tools(message, employee, sources, usage, old_version, policy_context)
+            messages.append({"role": "user", "content": results})
+            update_current_span(metadata={"round": round_number + 1, "ended_with": "tool results",
+                                          "tool_calls": len(results)})
+
+    if finished:
+        text, sources, answer_guardrail = finished
+        _record_answer(trace, text, sources, usage, "answered", output_guardrail=answer_guardrail)
+        return text, sources
 
     log_request(employee, question, usage, started)
-    return "Sorry, I couldn't finish that answer. Please try again.", sources
+    unfinished = "Sorry, I couldn't finish that answer. Please try again."
+    _record_answer(trace, unfinished, sources, usage, f"stopped: tool round limit reached ({MAX_TOOL_ROUNDS})")
+    return unfinished, sources
+
+
+def _record_answer(trace, text, sources, usage, outcome, output_guardrail=None):
+    """Tracing: the whole request on the top-level span, the first thing you see in Langfuse."""
+    titles = []
+    for source in sources:
+        if source.get("title") not in titles:
+            titles.append(source.get("title"))
+
+    if outcome == "answered" or outcome.startswith("small talk"):
+        level = None
+        message = None
+    else:
+        level = "WARNING"
+        message = outcome
+    if "ungrounded_answer_replaced" in usage["tools_used"] or output_guardrail in ("masked", "blocked"):
+        level = "WARNING"
+
+    update_current_span(
+        input={"question": trace["question"], "history_turns": trace["history_turns"]},
+        output={"answer": text, "sources": titles},
+        metadata={
+            "outcome": outcome,
+            "role": trace["role"],
+            "question_guardrail": trace["question_guardrail"],
+            "answer_guardrail": output_guardrail or "not reached",
+            "rounds_used": trace["rounds"],
+            "max_tool_rounds": MAX_TOOL_ROUNDS,
+            "tools_used": usage["tools_used"],
+            "old_version": trace.get("old_version", False),
+            "follow_up_context_used": trace.get("follow_up_context_used", False),
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+            "sources": titles,
+        },
+        level=level,
+        status_message=message,
+    )
 
 
 def log_request(employee, question, usage, started):
@@ -395,4 +522,5 @@ def log_request(employee, question, usage, started):
 @cache
 def judge_client():
     from app.model_gateway import GatewayClient
-    return GatewayClient(timeout=6)
+    # LiteLLM feature 8, tags: inline judge checks are tagged inline-judge.
+    return GatewayClient(timeout=6, purpose="inline-judge")

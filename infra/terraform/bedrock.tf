@@ -5,9 +5,10 @@
 
 resource "aws_bedrock_guardrail" "hr" {
   name        = "${local.name}-guardrail"
-  description = "Blocks harmful content, prompt attacks and sensitive numbers in the HR assistant"
+  description = "Blocks harmful content, prompt attacks and sensitive numbers, and masks contact details, in the HR assistant"
 
-  blocked_input_messaging   = "I can't help with that request. For HR questions, contact People Operations."
+  # One message covers every blocked question, so it names the case a person can fix.
+  blocked_input_messaging   = "I can't help with that message. If it included a Social Security, card or bank account number, remove the number and ask again. For anything else, contact People Operations."
   blocked_outputs_messaging = "I can't share that answer. Please contact People Operations."
 
   # Harmful content, in questions and in answers
@@ -45,8 +46,9 @@ resource "aws_bedrock_guardrail" "hr" {
     }
   }
 
-  # Numbers that must never appear in a chat. Salaries and names are fine: row-level security handles those.
+  # Personal data. Salaries and names are fine: row-level security decides who sees those.
   sensitive_information_policy_config {
+    # BLOCK: numbers that must never appear in a chat. The whole text is replaced.
     pii_entities_config {
       type   = "US_SOCIAL_SECURITY_NUMBER"
       action = "BLOCK"
@@ -59,6 +61,26 @@ resource "aws_bedrock_guardrail" "hr" {
       type   = "US_BANK_ACCOUNT_NUMBER"
       action = "BLOCK"
     }
+    # ANONYMIZE: contact details are replaced with {EMAIL} or {PHONE}, and the rest
+    # of the question is still answered. The masked text is what gets stored and traced.
+    # With only "action" set, Bedrock masked answers but not questions, so both
+    # directions are switched on explicitly.
+    pii_entities_config {
+      type           = "EMAIL"
+      action         = "ANONYMIZE"
+      input_action   = "ANONYMIZE"
+      input_enabled  = true
+      output_action  = "ANONYMIZE"
+      output_enabled = true
+    }
+    pii_entities_config {
+      type           = "PHONE"
+      action         = "ANONYMIZE"
+      input_action   = "ANONYMIZE"
+      input_enabled  = true
+      output_action  = "ANONYMIZE"
+      output_enabled = true
+    }
   }
 }
 
@@ -66,4 +88,11 @@ resource "aws_bedrock_guardrail" "hr" {
 resource "aws_bedrock_guardrail_version" "hr" {
   guardrail_arn = aws_bedrock_guardrail.hr.guardrail_arn
   description   = "Used by the chat and evaluate functions"
+  # Keep old versions: a published Lambda version still names the guardrail version it shipped with.
+  skip_destroy = true
+
+  lifecycle {
+    # Publish a new version whenever the guardrail's settings change.
+    replace_triggered_by = [aws_bedrock_guardrail.hr]
+  }
 }

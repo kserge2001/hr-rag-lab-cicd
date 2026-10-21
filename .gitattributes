@@ -2,3 +2,4 @@
 *.pdf binary
 *.docx binary
 *.png binary
+*.sh text eol=lf

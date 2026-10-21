@@ -1,0 +1,4 @@
+# Code scan tools, pinned so a new tool release cannot change the results unnoticed.
+ruff==0.17.1
+bandit==1.9.4
+pip-audit==2.10.1

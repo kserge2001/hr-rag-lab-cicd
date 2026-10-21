@@ -55,11 +55,18 @@ import os, sys, zipfile
 
 stage, target = sys.argv[1], sys.argv[2]
 with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
-    for folder, _, files in os.walk(stage):
-        for name in files:
+    for folder, folders, files in os.walk(stage):
+        folders.sort()
+        for name in sorted(files):
             full = os.path.join(folder, name)
-            # Zip entries always use forward slashes, whatever the machine building them
-            archive.write(full, os.path.relpath(full, stage).replace(os.sep, "/"))
+            # Zip entries always use forward slashes, whatever the machine building them.
+            # Fixed order and timestamps keep the zip identical for identical libraries,
+            # so Terraform publishes a new layer only when a library really changes.
+            info = zipfile.ZipInfo(os.path.relpath(full, stage).replace(os.sep, "/"), (1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = 0o644 << 16
+            with open(full, "rb") as source:
+                archive.writestr(info, source.read())
 PY
 
 SIZE_MB=$("$PYTHON" -c "import os;print(round(os.path.getsize('$BUILD_DIR/layer.zip')/1048576,1))")

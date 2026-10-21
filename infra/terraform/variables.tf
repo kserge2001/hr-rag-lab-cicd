@@ -127,3 +127,13 @@ variable "fallback_chat_model_id" {
   type        = string
   default     = "amazon.nova-lite-v1:0"
 }
+
+variable "gateway_secondary_region" {
+  description = <<-EOT
+    A second region for the fallback model. The gateway load-balances the fallback
+    model between aws_region and this region. The model must be available on demand
+    there. Empty keeps every model call in aws_region.
+  EOT
+  type        = string
+  default     = "us-west-2"
+}

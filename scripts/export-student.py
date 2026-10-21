@@ -14,7 +14,7 @@ def allowed(path):
         return False
     if any(part in SKIP for part in path.relative_to(ROOT).parts):
         return False
-    return not (path.name in {'tfplan', 'prepare_lab.py', 'WEEK06-HANDOFF.md', 'HR-LAB-AGREED-PLAN.md', 'promptfoo.generated.json'} or (path.name.startswith('.env') and path.name != '.env.langfuse.example') or path.name.endswith(('.tfstate', '.tfplan', '.pyc', '.pyo'))
+    return not (path.name in {'tfplan', 'demo-sign-in.txt', 'prepare_lab.py', 'WEEK06-HANDOFF.md', 'HR-LAB-AGREED-PLAN.md', 'promptfoo.generated.json'} or (path.name.startswith('.env') and path.name != '.env.langfuse.example') or path.name.endswith(('.tfstate', '.tfplan', '.pyc', '.pyo'))
                 or '.tfstate.' in path.name or
                 (path.suffix == '.tfvars' and path.name != 'terraform.tfvars.example'))
 

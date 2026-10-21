@@ -34,6 +34,41 @@ function Thinking() {
   );
 }
 
+// Thumbs up or down under an answer. A thumbs down asks what was wrong, in a few words.
+// The rating goes to Langfuse as a score on the answer's trace, so someone can review it.
+function Feedback({ api, conversationId, traceId }) {
+  const [vote, setVote] = useState(null); // "up", "down" or null
+  const [comment, setComment] = useState("");
+  const [sent, setSent] = useState(false);
+
+  async function rate(helpful, text = "") {
+    setVote(helpful ? "up" : "down");
+    try {
+      await api.feedback(conversationId, traceId, helpful, text);
+      setSent(helpful || text !== "");
+    } catch {
+      setVote(null); // let the person try again
+    }
+  }
+
+  if (sent) {
+    return <p className="feedback-thanks">Thanks for the feedback.</p>;
+  }
+  return (
+    <div className="feedback">
+      <button className={vote === "up" ? "chosen" : ""} aria-label="Helpful answer" onClick={() => rate(true)}>👍</button>
+      <button className={vote === "down" ? "chosen" : ""} aria-label="Unhelpful answer" onClick={() => rate(false)}>👎</button>
+      {vote === "down" && (
+        <form className="feedback-comment" onSubmit={(event) => { event.preventDefault(); rate(false, comment); }}>
+          <input value={comment} maxLength={1000} placeholder="What was wrong? (optional)"
+                 onChange={(event) => setComment(event.target.value)} />
+          <button type="submit">Send</button>
+        </form>
+      )}
+    </div>
+  );
+}
+
 function SendIcon() {
   return (
     <svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -107,7 +142,7 @@ export default function Chat({ signIn, onSignOut }) {
       const reply = await api.chat(asked, conversationId);
       setMessages((current) => [
         ...current,
-        { role: "assistant", content: reply.answer, sources: reply.sources },
+        { role: "assistant", content: reply.answer, sources: reply.sources, traceId: reply.trace_id },
       ]);
       if (conversationId === null) {
         setConversationId(reply.conversation_id);
@@ -208,6 +243,9 @@ export default function Chat({ signIn, onSignOut }) {
                         <span className="source-chip" key={source}>{source}</span>
                       ))}
                     </div>
+                  )}
+                  {message.traceId && conversationId && (
+                    <Feedback api={api} conversationId={conversationId} traceId={message.traceId} />
                   )}
                 </div>
               </div>

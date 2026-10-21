@@ -34,6 +34,7 @@ from opensearchpy import AWSV4SignerAuth, OpenSearch, RequestsHttpConnection, he
 from opensearchpy.exceptions import RequestError
 
 from app import config
+from app.telemetry import observed, update_current_span
 
 
 @cache
@@ -125,6 +126,7 @@ def _statuses(include_superseded):
     return ["current", "superseded"] if include_superseded else ["current"]
 
 
+@observed("OpenSearch vector query", "retriever")
 def search(vector, access_levels, include_superseded=False, statuses=None, regions=None, filenames=None):
     """Find the closest chunks among the documents this person may read.
 
@@ -156,9 +158,50 @@ def search(vector, access_levels, include_superseded=False, statuses=None, regio
             },
         },
     )
-    return response["hits"]["hits"]
+    hits = response["hits"]["hits"]
+    _record_hits("vector", hits, access_levels, statuses or _statuses(include_superseded), regions, filenames)
+    return hits
 
 
+def _record_hits(search_type, hits, access_levels, statuses, regions=None, filenames=None):
+    """Tracing: the filters this search applied, and which documents it found with what score."""
+    found = []       # facts about each passage: safe as metadata
+    passages = []    # the same, plus the passage text: content, so only when allowed
+    for hit in hits:
+        chunk = hit["_source"]
+        summary = {
+            "title": chunk.get("title"),
+            "section": chunk.get("section"),
+            "version": chunk.get("version"),
+            "status": chunk.get("status"),
+            "region": chunk.get("region"),
+            "access_level": chunk.get("access_level"),
+            "score": round(hit.get("_score", 0), 4),
+        }
+        found.append(summary)
+        passages.append(dict(summary, content=chunk.get("content")))
+
+    if filenames is None:
+        file_filter = "none"
+    else:
+        file_filter = f"{len(filenames)} approved historical files"
+
+    update_current_span(
+        output={"passages": passages},
+        metadata={
+            "search_type": search_type,
+            "access_levels": access_levels,
+            "statuses": statuses,
+            "regions": regions or "any",
+            "file_filter": file_filter,
+            "results_requested": config.RESULTS_PER_SEARCH,
+            "hits": len(hits),
+            "found": found,
+        },
+    )
+
+
+@observed("OpenSearch keyword query", "retriever")
 def keyword_search(text, access_levels, include_superseded=False):
     """Match the words themselves, for the questions vectors are bad at.
 
@@ -187,4 +230,7 @@ def keyword_search(text, access_levels, include_superseded=False):
             },
         },
     )
-    return response["hits"]["hits"]
+    hits = response["hits"]["hits"]
+    update_current_span(input={"text": text})
+    _record_hits("keyword", hits, access_levels, _statuses(include_superseded))
+    return hits

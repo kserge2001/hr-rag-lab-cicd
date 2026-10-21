@@ -48,9 +48,10 @@ resource "aws_lambda_permission" "trace_logs" {
   source_account = data.aws_caller_identity.current.account_id
 }
 resource "aws_cloudwatch_log_subscription_filter" "traces" {
-  name            = "hr-span-export"
-  log_group_name  = aws_cloudwatch_log_group.lambda["chat"].name
-  filter_pattern  = "{ $.trace_record = \"hr_otel\" }"
+  name           = "hr-span-export"
+  log_group_name = aws_cloudwatch_log_group.lambda["chat"].name
+  # Spans and user-feedback scores both go to the exporter.
+  filter_pattern  = "{ ($.trace_record = \"hr_otel\") || ($.trace_record = \"hr_score\") }"
   destination_arn = aws_lambda_function.trace_exporter.arn
   depends_on      = [aws_lambda_permission.trace_logs]
 }

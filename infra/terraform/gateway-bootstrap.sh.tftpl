@@ -1,50 +1,237 @@
 #!/bin/bash
 set -euo pipefail
 # Never enable shell tracing: environment files contain secrets.
+#
+# This script runs once, when the gateway instance first starts. It writes the
+# LiteLLM configuration, starts Redis and the LiteLLM proxy, then creates the
+# application's key.
+#
+# LiteLLM does the work for every feature below inside the proxy. This file only
+# switches each feature on. Search the repository for "LiteLLM feature" to find
+# both halves: where a feature is configured here, and where the application
+# uses it in lambda/app/model_gateway.py.
+#
+#   1. Routing          one endpoint, several models          model_list
+#   2. Load balancing   one model name, two regions           model_list + routing_strategy
+#   3. Fallback         another model when one fails          router_settings.fallbacks
+#   4. Caching          repeat answers come from Redis        litellm_settings.cache
+#   5. Cost tracking    price of every request, and budgets   key creation in start.py
+#   6. Rate limits      requests and tokens per minute        key creation in start.py
+#   7. Request logs     every call visible in the UI          general_settings
+#   8. Tags and users   spend per purpose and per user        sent by the application
+#   9. Task routing     pick a model by how hard the request is   model_list: hr-auto (demo only)
+#  10. Teams and people a team budget, and limits per person   team and budget creation in start.py
+#
+# The application's key can use only the chat and fallback models. hr-auto and
+# demo-broken are for the admin UI playground, signed in as admin.
 dnf install -y docker python3
 command -v aws >/dev/null
 systemctl enable --now docker
 install -d -m 700 /opt/hr-gateway
 cat >/opt/hr-gateway/config.yaml <<'YAML'
+# LiteLLM feature 1, routing: the application sends every request to one
+# address and names a model. LiteLLM finds that model below and calls Bedrock.
+# Each model_info.id names one deployment. The UI and the x-litellm-model-id
+# response header show which deployment answered.
 model_list:
   - model_name: ${chat_model}
     litellm_params:
       model: bedrock/${chat_model}
       aws_region_name: ${region}
+    model_info:
+      id: chat-${region}
+%{ if fallback_model != chat_model ~}
+  # LiteLLM feature 2, load balancing: the next two deployments share one
+  # model name, so LiteLLM spreads requests for that name across both regions.
   - model_name: ${fallback_model}
     litellm_params:
       model: bedrock/${fallback_model}
       aws_region_name: ${region}
+    model_info:
+      id: fallback-${region}
+%{ if secondary_region != "" ~}
+  - model_name: ${fallback_model}
+    litellm_params:
+      model: bedrock/${fallback_model}
+      aws_region_name: ${secondary_region}
+    model_info:
+      id: fallback-${secondary_region}
+%{ endif ~}
+%{ endif ~}
+  # LiteLLM feature 9, task routing (demo only): a request for "hr-auto" is scored
+  # by local keyword rules into a tier, and each tier names the model that answers.
+  # Easy questions go to the cheaper model. The application's key cannot use
+  # hr-auto, so try it from the UI playground signed in as admin.
+  - model_name: hr-auto
+    litellm_params:
+      model: auto_router/complexity_router
+      complexity_router_config:
+        classifier_type: heuristic
+        tiers:
+          SIMPLE: ${fallback_model}
+          MEDIUM: ${chat_model}
+          COMPLEX: ${chat_model}
+          REASONING: ${chat_model}
+  # LiteLLM feature 3, fallback (demo only): this deployment names a Bedrock model
+  # that does not exist, so every call fails for real. LiteLLM then answers with the
+  # fallback model. Ask for "demo-broken" in the playground and check Logs.
+  - model_name: demo-broken
+    litellm_params:
+      model: bedrock/amazon.nova-does-not-exist-v1:0
+      aws_region_name: ${region}
+    model_info:
+      id: demo-broken-${region}
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
   database_url: os.environ/DATABASE_URL
-  disable_spend_logs: true
+  # LiteLLM feature 7, request logs: every call is saved with its prompt and
+  # response, and appears on the UI Logs page. This project uses synthetic data only.
+  store_prompts_in_spend_logs: true
 litellm_settings:
+  # No automatic retries, so one failure never turns into several paid calls.
   num_retries: 0
   request_timeout: 20
+  # LiteLLM feature 4, caching: answers are stored in Redis for one hour.
+  # default_off means a request is cached only when it asks to be.
+  cache: true
+  cache_params:
+    type: redis
+    host: hr-redis
+    port: 6379
+    ttl: 3600
+    mode: default_off
 router_settings:
+  # LiteLLM feature 2, load balancing: pick a deployment at random for each request.
+  routing_strategy: simple-shuffle
   num_retries: 0
   timeout: 20
+  # LiteLLM feature 3, fallback: a deployment that fails once is taken out of
+  # rotation for 30 seconds, and the request moves to the fallback model.
+  allowed_fails: 1
+  cooldown_time: 30
+  fallbacks:
+%{ if fallback_model != chat_model ~}
+    - "${chat_model}": ["${fallback_model}"]
+%{ endif ~}
+    - "demo-broken": ["${fallback_model}"]
 YAML
 cat >/opt/hr-gateway/start.py <<'PY'
-import json, subprocess, time, urllib.request, urllib.parse
+import json, subprocess, time, urllib.error, urllib.request, urllib.parse
 from pathlib import Path
 settings=json.loads(subprocess.check_output(['aws','secretsmanager','get-secret-value','--region','${region}','--secret-id','${settings_secret}','--query','SecretString','--output','text']))
 url='postgresql://llm_gateway:'+urllib.parse.quote(settings['password'],safe='')+'@${host}:5432/litellm?sslmode=require'
 env=Path('/opt/hr-gateway/gateway.env')
 env.write_text('DATABASE_URL='+url+'\nLITELLM_MASTER_KEY='+settings['master_key']+'\nAWS_REGION_NAME=${region}\nAWS_DEFAULT_REGION=${region}\nLITELLM_LOG=ERROR\n')
 env.chmod(0o600)
-subprocess.run(['docker','run','-d','--name','hr-litellm','--restart','unless-stopped','--env-file',str(env),'-p','4000:4000','-v','/opt/hr-gateway/config.yaml:/app/config.yaml:ro','ghcr.io/berriai/litellm:v1.103.4','--config','/app/config.yaml','--port','4000'],check=True,stdout=subprocess.DEVNULL)
+# LiteLLM feature 4, caching: Redis on a private Docker network. Only the proxy
+# container can reach it.
+subprocess.run(['docker', 'network', 'create', 'hr-gateway'],
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+redis = ['docker', 'run', '-d', '--name', 'hr-redis', '--network', 'hr-gateway',
+         '--restart', 'unless-stopped', 'redis:7.4-alpine',
+         'redis-server', '--save', '', '--appendonly', 'no']   # memory only, nothing on disk
+subprocess.run(redis, check=True, stdout=subprocess.DEVNULL)
+subprocess.run(['docker','run','-d','--name','hr-litellm','--network','hr-gateway','--restart','unless-stopped','--env-file',str(env),'-p','4000:4000','-v','/opt/hr-gateway/config.yaml:/app/config.yaml:ro','ghcr.io/berriai/litellm:v1.103.4','--config','/app/config.yaml','--port','4000'],check=True,stdout=subprocess.DEVNULL)
+
+# LiteLLM feature 10, teams and per-person limits. A platform team groups keys
+# under a team, gives the team its own budget, and limits what each person may use.
+GATEWAY = 'http://127.0.0.1:4000'
+
+# The team that owns this application. Its budget and limits cover every key it owns.
+team_settings = {
+    'team_id': 'hr-assistant',
+    'team_alias': 'HR assistant',
+    'models': ['${chat_model}', '${fallback_model}'],
+    'max_budget': 5,
+    'budget_duration': '24h',
+}
+
+# The limit for each person. The application sends an opaque user ID with every
+# chat call, and LiteLLM counts spend, tokens and requests per ID.
+person_budget = {
+    'budget_id': 'hr-employee-daily',
+    'max_budget': 0.50,         # US dollars per person per day
+    'budget_duration': '24h',
+    'tpm_limit': 20000,         # tokens per minute per person
+    'rpm_limit': 15,            # requests per minute per person
+}
+
+# The application's key. LiteLLM checks every request against these settings
+# before it calls a model.
+app_key_settings = {
+    'key_alias': 'hr-generation-and-judges',
+    'team_id': 'hr-assistant',
+    # Only these models. A request for any other model is refused.
+    'models': ['${chat_model}', '${fallback_model}'],
+    # LiteLLM feature 5, cost tracking: LiteLLM prices every request from its
+    # token counts and its built-in price list for each model, then adds the
+    # cost to this key's spend. Once spend reaches max_budget, requests are
+    # refused until the budget window starts again.
+    'max_budget': 5,
+    'budget_duration': '24h',
+    # LiteLLM feature 6, rate limits: requests and tokens per minute, and how
+    # many requests may run at the same time.
+    'rpm_limit': 120,
+    'tpm_limit': 120000,
+    'max_parallel_requests': 2,
+    # LiteLLM feature 10: every person calling through this key gets person_budget.
+    'metadata': {'end_user_budget_id': 'hr-employee-daily'},
+}
+
+
+def call_gateway(path, body):
+    """Send one admin request to the gateway with the master key. Returns the JSON reply."""
+    request = urllib.request.Request(
+        GATEWAY + path,
+        data=json.dumps(body).encode(),
+        headers={'Authorization': 'Bearer ' + settings['master_key'],
+                 'Content-Type': 'application/json'})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return json.load(response)
+
+
+def create_or_update(kind, body):
+    """Create a team or budget. If an earlier instance already created it, update it instead."""
+    try:
+        call_gateway('/' + kind + '/new', body)
+    except urllib.error.HTTPError:
+        call_gateway('/' + kind + '/update', body)
+
+
+def saved_application_key():
+    """The key an earlier instance saved in Secrets Manager, or None on a first start."""
+    result = subprocess.run(['aws', 'secretsmanager', 'get-secret-value', '--region', '${region}',
+                             '--secret-id', '${key_secret}', '--query', 'SecretString', '--output', 'text'],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        return None   # the secret has no value yet
+    return json.loads(result.stdout).get('key')
+
+
 # Startup restarts until setup-db has created the separate database.
 for attempt in range(240):
     try:
-        body=json.dumps({'key_alias':'hr-generation-and-judges','models':['${chat_model}','${fallback_model}'],'max_budget':5,'budget_duration':'24h','rpm_limit':120,'tpm_limit':120000,'max_parallel_requests':2}).encode()
-        req=urllib.request.Request('http://127.0.0.1:4000/key/generate',data=body,headers={'Authorization':'Bearer '+settings['master_key'],'Content-Type':'application/json'})
-        with urllib.request.urlopen(req,timeout=10) as response:key=json.load(response)['key']
-        subprocess.run(['aws','secretsmanager','put-secret-value','--region','${region}','--secret-id','${key_secret}','--secret-string',json.dumps({'key':key})],check=True,stdout=subprocess.DEVNULL)
-        print('Gateway database, scoped key and limits initialized')
+        create_or_update('team', team_settings)
+        create_or_update('budget', person_budget)
+        # The database outlives the instance, so a rebuilt gateway finds the key an
+        # earlier instance created. Key aliases must be unique, so update that key in
+        # place. Its value stays the same, and running Lambdas keep working.
+        key = saved_application_key()
+        if key:
+            call_gateway('/key/update', dict(app_key_settings, key=key))
+        else:
+            key = call_gateway('/key/generate', app_key_settings)['key']
+        # The application reads its key from Secrets Manager. It never sees the master key.
+        # Writing it, even unchanged, also tells setup this instance has finished:
+        # initialize-gateway.py waits for a version written after the instance launched.
+        subprocess.run(['aws', 'secretsmanager', 'put-secret-value', '--region', '${region}',
+                        '--secret-id', '${key_secret}', '--secret-string', json.dumps({'key': key})],
+                       check=True, stdout=subprocess.DEVNULL)
+        print('Gateway database, team, budgets, scoped key and limits initialized')
         break
-    except Exception:time.sleep(10)
-else:raise RuntimeError('Gateway initialization did not finish')
+    except Exception:
+        time.sleep(10)
+else:
+    raise RuntimeError('Gateway initialization did not finish')
 PY
 python3 /opt/hr-gateway/start.py
