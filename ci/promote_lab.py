@@ -13,7 +13,9 @@ if config['CodeSha256']!=expected:raise SystemExit('Published artifact differs f
 try:
     alias=client.get_alias(FunctionName=function,Name='approved')
     (root/'build/previous-approved.json').write_text(json.dumps({'function':function,'version':alias['FunctionVersion']}))
-    client.update_alias(FunctionName=function,Name='approved',FunctionVersion=version,RevisionId=alias['RevisionId'])
+    # The alias description records the version it replaced, so ci/rollback_lab.py can restore it.
+    client.update_alias(FunctionName=function,Name='approved',FunctionVersion=version,RevisionId=alias['RevisionId'],
+                        Description=f"Lab approved release pointer; release v{release['version']}; previous approved version: {alias['FunctionVersion']}")
 except client.exceptions.ResourceNotFoundException:
-    client.create_alias(FunctionName=function,Name='approved',FunctionVersion=version,Description='Classroom release pointer; not production')
-print('Exact tested candidate promoted to the lab approved alias; production is separate')
+    client.create_alias(FunctionName=function,Name='approved',FunctionVersion=version,Description=f"Lab approved release pointer; release v{release['version']}; previous approved version: none")
+print(f"Release v{release['version']} (Lambda version {version}) promoted to the lab approved alias; production is separate")

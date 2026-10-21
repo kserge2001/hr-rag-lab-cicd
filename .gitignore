@@ -2,6 +2,8 @@
 .env
 *.tfvars
 !terraform.tfvars.example
+# Written by setup: the app address and the demo employees' sign-in password
+demo-sign-in.txt
 
 # Build artifacts: rebuild them with scripts/build-*.sh, never commit them
 build/

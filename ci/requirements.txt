@@ -1,4 +1,4 @@
 boto3>=1.35,<2
 requests>=2.32,<3
-langfuse==4.17.0
-pytest>=8,<9
+langfuse==5.0.4
+pytest>=9,<10

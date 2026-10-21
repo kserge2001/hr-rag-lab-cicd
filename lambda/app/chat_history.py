@@ -46,6 +46,15 @@ def get_messages(conversation_id, employee_id):
     )
 
 
+def delete_conversation(conversation_id, employee_id):
+    """Delete one of this employee's conversations and its messages. Returns False if it is not theirs."""
+    rows = database.query(
+        "DELETE FROM conversations WHERE id = %s AND employee_id = %s RETURNING id",
+        (conversation_id, employee_id),
+    )
+    return bool(rows)
+
+
 def add_message(conversation_id, role, content, sources=None):
     """Save one message. role is "user" or "assistant".
 

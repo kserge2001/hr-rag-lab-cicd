@@ -113,7 +113,9 @@ resource "aws_cloudfront_distribution" "app" {
     cloudfront_default_certificate = local.use_custom_domain ? null : true
     acm_certificate_arn            = local.certificate_arn
     ssl_support_method             = local.use_custom_domain ? "sni-only" : null
-    minimum_protocol_version       = "TLSv1.2_2021"
+    # The shared certificate always uses CloudFront's fixed TLSv1 policy; asking for more there
+    # only makes every plan show a change that never applies.
+    minimum_protocol_version = local.use_custom_domain ? "TLSv1.2_2021" : "TLSv1"
   }
 }
 

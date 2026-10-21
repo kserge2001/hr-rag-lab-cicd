@@ -31,3 +31,12 @@ resource "aws_secretsmanager_secret" "evaluation_users" {
   description = "Synthetic staging-only evaluation passwords; secure bootstrap owns the value"
 }
 output "evaluation_users_secret_arn" { value = aws_secretsmanager_secret.evaluation_users.arn }
+
+# The demo employees people sign in as. Kept apart from the pipeline's test accounts above,
+# so the CI role, which can read only that secret, never holds a person's password.
+resource "aws_secretsmanager_secret" "demo_users" {
+  name                    = "${local.name}-demo-users"
+  description             = "Shared sign-in password for the demo employees; set by setup, never by CI"
+  recovery_window_in_days = 0 # deleted at once on destroy, so the name can be reused
+}
+output "demo_users_secret_arn" { value = aws_secretsmanager_secret.demo_users.arn }

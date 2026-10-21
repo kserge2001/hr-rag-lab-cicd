@@ -119,12 +119,63 @@ def search_probe(query, old_version=False):
     ]
 
 
+def retrieval_context(cases):
+    """The passages retrieval returns for each question, as the case's test account would get them.
+
+        --payload '{"retrieve": [{"question": "How many sick days?", "email": "qa.employee@northwind.example"}]}'
+
+    The pipeline uses these for two checks: did search find the expected policy (retrieval
+    quality), and is every claim in the answer supported by these passages (faithfulness).
+    Only test accounts may be named, so this can never read a real person's documents.
+    """
+    results = []
+    for case in cases:
+        email = case["email"]
+        if not email.lower().startswith("qa."):
+            raise ValueError("retrieve only accepts the pipeline's test accounts")
+        employee = employees.find_by_email(email)
+        chunks = retrieval.search_policies(case["question"], employee["role"])
+        passages = []
+        for rank, chunk in enumerate(chunks, start=1):
+            passages.append({
+                "rank": rank,
+                "title": chunk.get("title"),
+                "section": chunk.get("section"),
+                "similarity": chunk.get("similarity"),
+                "content": chunk.get("content"),
+            })
+        results.append({"question": case["question"], "passages": passages})
+    return results
+
+
+def text_similarity(pairs):
+    """How close in meaning each pair of texts is, from -1 to 1, using the app's own Titan embeddings.
+
+        --payload '{"similarity": [["first answer", "second answer"]]}'
+
+    The pipeline compares the two answers to the same question: a low score means the
+    assistant said different things when asked the same thing twice.
+    """
+    scores = []
+    for first, second in pairs:
+        vectors = embeddings.embed([first, second])
+        # The vectors are normalized, so their dot product is their cosine similarity.
+        score = sum(a * b for a, b in zip(vectors[0], vectors[1]))
+        scores.append(round(score, 4))
+    return scores
+
+
 def handler(event, context):
+    if (event or {}).get("retrieve"):
+        return retrieval_context(event["retrieve"])
+    if (event or {}).get("similarity"):
+        return text_similarity(event["similarity"])
     if (event or {}).get('gateway_judge'):
         # IAM-only Lambda invocation. The CI caller never receives the gateway key.
         from app.model_gateway import GatewayClient
         payload = event['gateway_judge']
-        return GatewayClient(timeout=30).converse(
+        # LiteLLM feature 8, tags: pipeline judge calls are tagged ci-judge.
+        return GatewayClient(timeout=30, purpose='ci-judge').converse(
             modelId=payload['model'], messages=payload['messages'],
             inferenceConfig={'maxTokens': 2048, 'temperature': 0})
     if (event or {}).get("search"):

@@ -25,5 +25,11 @@ export function makeApi(signIn) {
         method: "POST",
         body: JSON.stringify({ question, conversation_id: conversationId }),
       }),
+    // Thumbs up or down on one answer. It becomes a score on that answer's Langfuse trace.
+    feedback: (conversationId, traceId, helpful, comment) =>
+      request("/feedback", {
+        method: "POST",
+        body: JSON.stringify({ conversation_id: conversationId, trace_id: traceId, helpful, comment }),
+      }),
   };
 }

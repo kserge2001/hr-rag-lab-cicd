@@ -75,3 +75,5 @@ resource "aws_cognito_user" "demo" {
 
   message_action = "SUPPRESS"
 }
+
+output "demo_user_emails" { value = var.demo_user_emails }

@@ -13,6 +13,7 @@ the database never returns the rows.
 """
 
 from app import database
+from app.telemetry import observed, update_current_span
 
 
 def find_by_email(email):
@@ -29,6 +30,7 @@ def find_by_email(email):
     return rows[0] if rows else None
 
 
+@observed("Employee records query", "retriever")
 def visible_records(viewer):
     """Every employee record the viewer may see. Each lookup is written to the audit log."""
     rows = database.query(
@@ -45,5 +47,13 @@ def visible_records(viewer):
     database.query(
         "INSERT INTO employee_lookup_log (viewer_id, returned_ids) VALUES (%s, %s)",
         (viewer["employee_id"], [row["employee_id"] for row in rows]),
+    )
+
+    # Tracing: how many rows row-level security let through. The rows themselves
+    # (names, salaries) are content, so they appear only when content is allowed.
+    update_current_span(
+        output={"records": rows},
+        metadata={"viewer_role": viewer.get("role"), "rows_returned": len(rows),
+                  "filter": "row-level security in Aurora", "lookup_logged": True},
     )
     return rows

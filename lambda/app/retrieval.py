@@ -5,6 +5,7 @@ import json
 from functools import cache
 
 from app import config, database, embeddings, search_index
+from app.telemetry import observed, update_current_span
 
 # Phrases that ask for a version no longer in force. Deliberately narrow: "prior approval"
 # or "before booking" are ordinary questions and must not pull superseded figures in.
@@ -62,6 +63,7 @@ def similarity_from_score(score):
     return 1 - 1 / score
 
 
+@observed("Policy search", "retriever")
 def search_policies(question, role, old_version=False):
     """Return the policy chunks that answer the question, for this role.
 
@@ -72,9 +74,13 @@ def search_policies(question, role, old_version=False):
     """
     levels = allowed_access_levels(role)
     if not levels:
+        update_current_span(input={"query": question}, metadata={"role": role, "access_levels": []},
+                            level="WARNING", status_message="This role may read no policy documents")
         return []
 
     old = old_version or asks_for_old_version(question)
+    # Tracing: which extra searches ran. Use case 3 switches off the supplemental PTO searches.
+    searches_run = ["main"]
     question_vector = embeddings.embed([question])[0]
     results = _current_matches(question, question_vector, levels)
 
@@ -83,18 +89,24 @@ def search_policies(question, role, old_version=False):
     # UK one), so without this the right country's passage can miss the cut.
     regions = regions_named(question)
     if regions:
+        searches_run.append("country: " + ", ".join(regions))
         local = _extra_matches(question_vector, levels, regions=regions)
         seen = {chunk["content"] for chunk in local}
         results = local + [chunk for chunk in results if chunk["content"] not in seen]
 
-    # A PTO question can retrieve carryover alone. Include annual entitlement
-    # evidence too, under the same permissions and current-policy filter.
+    # A PTO question can retrieve carryover alone, or the annual entitlement alone.
+    # Include both, under the same permissions and current-policy filter. Without
+    # the carryover rule in the evidence, a follow-up such as "what does the current
+    # policy say?" was answered with an invented "no carryover allowed".
     if re.search(r"\b(pto|time off|annual leave|vacation|carryover|carry over)\b", question, re.I):
-        entitlement = "annual paid time off entitlement days per year"
-        vector = embeddings.embed([entitlement])[0]
-        extra = _current_matches(entitlement, vector, levels)
-        seen = {chunk["content"] for chunk in results}
-        results += [chunk for chunk in extra if chunk["content"] not in seen]
+        searches_run.append("supplemental annual entitlement")
+        searches_run.append("supplemental carryover")
+        for topic in ("annual paid time off entitlement days per year",
+                      "unused paid time off carryover days into next year"):
+            vector = embeddings.embed([topic])[0]
+            extra = _current_matches(topic, vector, levels)
+            seen = {chunk["content"] for chunk in results}
+            results += [chunk for chunk in extra if chunk["content"] not in seen]
 
     if old:
         # A historical answer must not substitute today's figures for missing history.
@@ -103,11 +115,55 @@ def search_policies(question, role, old_version=False):
             for topic in ("paid time off annual entitlement", "paid time off carryover unused days"):
                 vector = embeddings.embed([topic])[0]
                 historical += _extra_matches(vector, levels, statuses=["superseded"])
+        searches_run.append("superseded versions")
         unique = {}
         for chunk in historical:
             unique[chunk["content"]] = chunk
-        return list(unique.values())
+        results = list(unique.values())
+
+    _record_search(question, role, levels, regions, old, searches_run, results)
     return results
+
+
+def _record_search(question, role, levels, regions, old, searches_run, results):
+    """Tracing: the query, the filters this role gets, which searches ran, and what came back."""
+    passages = []        # facts about each passage: safe as metadata
+    with_content = []    # the same, plus the passage text: content, so only when allowed
+    for chunk in results:
+        summary = {
+            "title": chunk.get("title"),
+            "section": chunk.get("section"),
+            "version": chunk.get("version"),
+            "status": chunk.get("status"),
+            "region": chunk.get("region"),
+            "similarity": chunk.get("similarity"),
+            "matched_by": chunk.get("matched_by", "meaning"),
+        }
+        passages.append(summary)
+        with_content.append(dict(summary, content=chunk.get("content")))
+    if results:
+        level = None
+        message = None
+    else:
+        level = "WARNING"
+        message = "No passage passed the similarity floor"
+    update_current_span(
+        input={"query": question},
+        output={"passages": with_content},
+        metadata={
+            "role": role,
+            "access_levels": levels,
+            "regions_named": regions or "none",
+            "old_version": old,
+            "searches_run": searches_run,
+            "similarity_floor": config.MIN_BEST_SIMILARITY,
+            "max_gap_from_best": config.MAX_GAP_FROM_BEST,
+            "passages_returned": len(results),
+            "passages": passages,
+        },
+        level=level,
+        status_message=message,
+    )
 
 
 @cache
